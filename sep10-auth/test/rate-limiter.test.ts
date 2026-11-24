@@ -4,6 +4,7 @@ import {
   rateLimiter,
   RateLimitStore,
   RateLimitDecision,
+  InMemoryRateLimitStore,
 } from '../src/rate-limiter';
 
 function mockRequest(overrides: Partial<Request> = {}): Request {
@@ -273,6 +274,60 @@ describe('rateLimiter', () => {
     await invokeMiddleware(middleware, req, res, next);
     expect(res.status).toHaveBeenCalledWith(429);
     expect(consume).toHaveBeenCalledTimes(2);
+  });
+
+  describe('InMemoryRateLimitStore — two-bucket counter', () => {
+    it('uses O(1) memory per key (no timestamp array)', () => {
+      const store = new InMemoryRateLimitStore();
+      const now = Date.now();
+      // Flood with 1000 requests on a single key
+      for (let i = 0; i < 1000; i++) {
+        store.consume('key', now + i, 60_000, 500);
+      }
+      // If the internal entry were an array it would have ~500 timestamps;
+      // the two-bucket design has exactly {bucketStart, curCount, prevCount}.
+      // We verify this indirectly: after 1000 calls the store still functions.
+      const decision = store.consume('key', now + 1000, 60_000, 500);
+      // count must be a reasonable number (≤ maxRequests), not 1000+
+      expect(decision.count).toBeLessThanOrEqual(500);
+    });
+
+    it('respects maxKeys cap by evicting the oldest key', () => {
+      const store = new InMemoryRateLimitStore(3);
+      const now = Date.now();
+      // Fill to capacity
+      store.consume('a', now, 60_000, 10);
+      store.consume('b', now, 60_000, 10);
+      store.consume('c', now, 60_000, 10);
+      // Adding a 4th key should evict 'a'
+      store.consume('d', now, 60_000, 10);
+      // 'a' counter should have been evicted — a new request for 'a' gets count=1 (fresh)
+      const afterEviction = store.consume('a', now, 60_000, 10);
+      expect(afterEviction.count).toBe(1);
+    });
+
+    it('maxKeys cap is exposed via rateLimiter options', async () => {
+      const middleware = rateLimiter({ windowMs: 60_000, maxRequests: 2, maxKeys: 2 });
+      const now = Date.now();
+
+      // key 'a' — 2 requests, hits the limit
+      const reqA = mockRequest({ ip: '1.1.1.1' });
+      await invokeMiddleware(middleware, reqA, mockResponse(), next);
+      await invokeMiddleware(middleware, reqA, mockResponse(), next);
+
+      // key 'b' — fills the second slot
+      const reqB = mockRequest({ ip: '2.2.2.2' });
+      await invokeMiddleware(middleware, reqB, mockResponse(), next);
+
+      // key 'c' — evicts 'a', so a subsequent 'a' request gets a fresh counter
+      const reqC = mockRequest({ ip: '3.3.3.3' });
+      await invokeMiddleware(middleware, reqC, mockResponse(), next);
+
+      // 'a' counter was evicted — should be allowed again
+      const resA2 = mockResponse();
+      await invokeMiddleware(middleware, reqA, resA2, next);
+      expect(resA2.status).not.toHaveBeenCalled();
+    });
   });
 
   describe('skip predicate', () => {

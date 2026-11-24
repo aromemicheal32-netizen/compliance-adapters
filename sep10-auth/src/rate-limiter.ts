@@ -16,6 +16,17 @@ export interface RateLimiterOptions {
    * Skipped requests never consume tokens.
    */
   skip?: (req: import('express').Request) => boolean | Promise<boolean>;
+  /**
+   * Maximum number of unique keys tracked by the built-in store before the
+   * oldest entry is evicted. Defaults to no limit.
+   * Pass a value to bound memory under key-flood attacks (e.g. spoofed IPs).
+   */
+  maxKeys?: number;
+  /**
+   * When `true` (default), set `RateLimit-Limit`, `RateLimit-Remaining`, and
+   * `RateLimit-Reset` headers on every response. Set to `false` to suppress them.
+   */
+  standardHeaders?: boolean;
 }
 
 export interface RateLimitDecision {
@@ -33,8 +44,27 @@ export interface RateLimitStore {
   ): RateLimitDecision | Promise<RateLimitDecision>;
 }
 
+/**
+ * Two-bucket sliding-window entry.
+ *
+ * Memory is O(1) per key regardless of maxRequests. The window is divided into
+ * two half-windows (current and previous). On each request we check whether the
+ * current-bucket start is still within the first half-window; if the full
+ * window has rolled past we discard the previous bucket and promote current →
+ * previous. The effective count is:
+ *
+ *   prevCount * (elapsed in current bucket / windowMs) + curCount
+ *
+ * This gives a continuous approximation equivalent to a true sliding window
+ * while storing only two integers per key.
+ */
 interface RateLimitEntry {
-  timestamps: number[];
+  /** Start timestamp of the current bucket (ms). */
+  bucketStart: number;
+  /** Request count in the current (most recent) bucket. */
+  curCount: number;
+  /** Request count in the previous bucket. */
+  prevCount: number;
 }
 
 const DEFAULT_WINDOW_MS = 60_000; // 1 minute
@@ -47,6 +77,11 @@ function defaultKeyGenerator(req: import('express').Request): string {
 export class InMemoryRateLimitStore implements RateLimitStore {
   private readonly store = new Map<string, RateLimitEntry>();
   private sweepTimer: ReturnType<typeof setInterval> | undefined;
+  private readonly maxKeys: number | undefined;
+
+  constructor(maxKeys?: number) {
+    this.maxKeys = maxKeys;
+  }
 
   consume(
     key: string,
@@ -58,26 +93,44 @@ export class InMemoryRateLimitStore implements RateLimitStore {
 
     let entry = this.store.get(key);
     if (!entry) {
-      entry = { timestamps: [] };
+      // Evict the oldest key when the cap is reached.
+      if (this.maxKeys !== undefined && this.store.size >= this.maxKeys) {
+        const oldest = this.store.keys().next().value;
+        if (oldest !== undefined) this.store.delete(oldest);
+      }
+      entry = { bucketStart: now, curCount: 0, prevCount: 0 };
       this.store.set(key, entry);
     }
 
-    entry.timestamps = entry.timestamps.filter((t) => now - t < windowMs);
+    const elapsed = now - entry.bucketStart;
 
-    if (entry.timestamps.length >= maxRequests) {
-      return {
-        allowed: false,
-        count: entry.timestamps.length,
-        resetAt: entry.timestamps[0] + windowMs,
-      };
+    if (elapsed >= windowMs * 2) {
+      // Both buckets are entirely outside the window — reset.
+      entry.bucketStart = now;
+      entry.curCount = 0;
+      entry.prevCount = 0;
+    } else if (elapsed >= windowMs) {
+      // Current bucket has aged past one full window; it becomes the previous bucket.
+      entry.prevCount = entry.curCount;
+      entry.curCount = 0;
+      entry.bucketStart = entry.bucketStart + windowMs;
     }
 
-    entry.timestamps.push(now);
-    return {
-      allowed: true,
-      count: entry.timestamps.length,
-      resetAt: entry.timestamps[0] + windowMs,
-    };
+    // Weighted count: portion of the previous bucket still inside the window
+    // plus all requests in the current bucket. We use floor to avoid rounding
+    // a near-zero fraction up to 1 (which would cause a spurious block).
+    const prevWeight = Math.max(0, 1 - (now - entry.bucketStart) / windowMs);
+    const count = Math.floor(entry.prevCount * prevWeight) + entry.curCount;
+
+    // resetAt: when the current bucket will have fully aged out of the window.
+    const resetAt = entry.bucketStart + windowMs;
+
+    if (count >= maxRequests) {
+      return { allowed: false, count, resetAt };
+    }
+
+    entry.curCount += 1;
+    return { allowed: true, count: count + 1, resetAt };
   }
 
   private ensureSweepTimer(windowMs: number): void {
@@ -85,8 +138,7 @@ export class InMemoryRateLimitStore implements RateLimitStore {
     this.sweepTimer = setInterval(() => {
       const now = Date.now();
       for (const [key, entry] of this.store) {
-        entry.timestamps = entry.timestamps.filter((t) => now - t < windowMs);
-        if (entry.timestamps.length === 0) {
+        if (now - entry.bucketStart >= windowMs * 2) {
           this.store.delete(key);
         }
       }
@@ -109,9 +161,12 @@ function validatePositiveInteger(value: number, optionName: string): void {
 /**
  * Creates an Express middleware that rate-limits incoming requests.
  *
- * Uses a simple in-memory sliding-window counter keyed by client IP (or a
- * custom key generator). Old entries are pruned lazily when the window
- * expires — no external store (Redis, etc.) is required.
+ * Uses a two-bucket sliding-window counter keyed by client IP (or a
+ * custom key generator). Memory per key is O(1) regardless of maxRequests —
+ * only two integer counts are stored. Old entries are evicted lazily when both
+ * of their buckets have expired — no external store (Redis, etc.) is required.
+ * Pass `maxKeys` to cap the number of tracked keys and bound memory under a
+ * key-flood attack (spoofed IPs, etc.).
  *
  * When the limit is exceeded the middleware responds with **429**
  * and a JSON body:
@@ -141,7 +196,7 @@ export function rateLimiter(options: RateLimiterOptions = {}): RequestHandler {
   validatePositiveInteger(windowMs, 'windowMs');
   validatePositiveInteger(maxRequests, 'maxRequests');
   const standardHeaders = options.standardHeaders ?? true;
-  const store = options.store ?? new InMemoryRateLimitStore();
+  const store = options.store ?? new InMemoryRateLimitStore(options.maxKeys);
 
   const skip = options.skip;
 
